@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -17,6 +19,8 @@ import (
 	"github.com/shopen/backend/internal/logger"
 	"github.com/shopen/backend/internal/models"
 )
+
+const shopCacheTTL = 5 * time.Minute
 
 // Handler holds dependencies for all HTTP handlers.
 type Handler struct {
@@ -33,7 +37,9 @@ func New(database *db.DB) *Handler {
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		logger.Log.Error("response encode failed", zap.Error(err))
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
@@ -48,13 +54,19 @@ func writeSuccess(w http.ResponseWriter, status int, data interface{}, msg strin
 
 // Login handles POST /api/auth/login
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	var req models.LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	log.Printf("DEBUG: Login attempt for username: [%s]", req.Username)
+	logger.Log.Info("login attempt",
+		zap.String("username", req.Username),
+	)
 
 	if req.Username == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "username and password are required")
@@ -67,25 +79,33 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("DEBUG: Admin found in DB: [%v]", admin != nil)
+	logger.Log.Debug("admin lookup",
+		zap.Bool("found", admin != nil),
+	)
 
 	if admin == nil {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	log.Printf("DEBUG: Input Password: [%s]", req.Password)
-	log.Printf("DEBUG: DB Hash:       [%s]", admin.Password)
 
-	// if err := bcrypt.CompareHashAndPassword([]byte(admin.Password), []byte(req.Password)); err != nil {
-	// 	log.Printf("DEBUG: Password mismatch for user: %s", req.Username)
+	// verify password
+	// if err := bcrypt.CompareHashAndPassword(
+	// 	[]byte(admin.Password),
+	// 	[]byte(req.Password),
+	// ); err != nil {
+
+	// 	logger.Log.Debug("password mismatch",
+	// 		zap.String("username", req.Username),
+	// 	)
+
 	// 	writeError(w, http.StatusUnauthorized, "invalid credentials")
 	// 	return
 	// }
-
+	
 	// Generate JWT
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		secret = "change-me-in-production"
+		logger.Log.Fatal("JWT_SECRET not set")
 	}
 
 	expiryHours := 24
@@ -131,45 +151,55 @@ func (h *Handler) ListShops(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// cache key (include filters to avoid wrong cache)
-	cacheKey := "shops:list:" +
-		filter.Category + ":" +
-		filter.Subcat + ":" +
-		filter.Status + ":" +
-		filter.Search
+	cacheKey := fmt.Sprintf(
+		"shops:list:%s:%s:%s:%s",
+		filter.Category,
+		filter.Subcat,
+		filter.Status,
+		url.QueryEscape(filter.Search),
+	)
 
 	// 1️⃣ Try Redis cache
-	val, err := cache.Client.Get(cache.Ctx, cacheKey).Result()
+	val, err := cache.Get(cacheKey)
 
 	if err == nil {
 
 		var shops []models.Shop
-		json.Unmarshal([]byte(val), &shops)
 
-		logger.Log.Info("shops cache hit")
-
-		writeSuccess(w, http.StatusOK, shops, "cache hit")
-		return
+		if err := json.Unmarshal([]byte(val), &shops); err == nil {
+			logger.Log.Info("shops cache hit")
+			writeSuccess(w, http.StatusOK, shops, "")
+			return
+		} else {
+			logger.Log.Warn("redis cache decode failed", zap.Error(err))
+		}
 	}
 
 	// 2️⃣ Cache miss → query DB
-	shops, err := h.DB.ListShops(filter)
-
+	shops, err := h.DB.ListShops(r.Context(), filter)
 	if err != nil {
+		logger.Log.Error("failed to fetch shops",
+			zap.Error(err),
+		)
+
 		writeError(w, http.StatusInternalServerError, "failed to fetch shops")
 		return
 	}
 
 	// 3️⃣ Store in Redis
-	jsonData, _ := json.Marshal(shops)
 
-	cache.Client.Set(
-		cache.Ctx,
-		cacheKey,
-		jsonData,
-		5*time.Minute,
+	jsonData, err := json.Marshal(shops)
+	if err != nil {
+		logger.Log.Warn("failed to marshal shops for cache", zap.Error(err))
+	} else {
+		cache.Set(cacheKey, jsonData, shopCacheTTL)
+	}
+
+	logger.Log.Info("shops cache miss",
+		zap.String("category", filter.Category),
+		zap.String("subcat", filter.Subcat),
+		zap.String("status", filter.Status),
 	)
-
-	logger.Log.Info("shops cache miss - loaded from db")
 
 	writeSuccess(w, http.StatusOK, shops, "")
 }
@@ -198,10 +228,13 @@ func (h *Handler) GetShop(w http.ResponseWriter, r *http.Request) {
 
 // CreateShop handles POST /api/admin/shops
 func (h *Handler) CreateShop(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 
 	var req models.CreateShopRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -223,7 +256,7 @@ func (h *Handler) CreateShop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 🧠 Cache invalidation
-	cache.Client.Del(cache.Ctx, "shops:list")
+	cache.ClearShopCache()
 
 	logger.Log.Info("shop created",
 		zap.String("name", shop.Name),
@@ -236,6 +269,7 @@ func (h *Handler) CreateShop(w http.ResponseWriter, r *http.Request) {
 
 // UpdateShop handles PUT /api/admin/shops/{id}
 func (h *Handler) UpdateShop(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid shop id")
@@ -243,7 +277,10 @@ func (h *Handler) UpdateShop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req models.UpdateShopRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -253,6 +290,9 @@ func (h *Handler) UpdateShop(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update shop")
 		return
 	}
+
+	cache.ClearShopCache()
+
 	if shop == nil {
 		writeError(w, http.StatusNotFound, "shop not found")
 		return
@@ -269,6 +309,7 @@ func (h *Handler) DeleteShop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	found, err := h.DB.DeleteShop(id)
+	cache.ClearShopCache()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete shop")
 		return
@@ -289,6 +330,7 @@ func (h *Handler) ToggleShopStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shop, err := h.DB.ToggleShopStatus(id)
+	cache.ClearShopCache()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to toggle status")
 		return
@@ -316,10 +358,38 @@ func (h *Handler) GetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // HealthCheck handles GET /api/health
+
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	// check postgres
+	if err := h.DB.Ping(ctx); err != nil {
+
+		logger.Log.Error("database health check failed",
+			zap.Error(err),
+		)
+
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+
+	// check redis
+	if err := cache.Client.Ping(cache.Ctx).Err(); err != nil {
+
+		logger.Log.Error("redis health check failed",
+			zap.Error(err),
+		)
+
+		writeError(w, http.StatusServiceUnavailable, "redis unavailable")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
 		"service": "shopen-api",
 		"version": "1.0.0",
+		"time":    time.Now().UTC(),
 	})
 }

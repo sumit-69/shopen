@@ -13,6 +13,7 @@ import (
 var Client *redis.Client
 var Ctx = context.Background()
 
+// Init initializes the Redis client and verifies the connection.
 func Init() {
 
 	addr := os.Getenv("REDIS_ADDR")
@@ -63,4 +64,63 @@ func Init() {
 	}
 
 	log.Fatalf("❌ Redis connection failed: %v", err)
+}
+
+//
+// ─────────────────────────────────────────────
+// Cache Helpers
+// ─────────────────────────────────────────────
+//
+
+// ClearShopCache removes all cached shop list keys.
+// This is used after create/update/delete operations.
+func ClearShopCache() {
+
+	var cursor uint64
+
+	for {
+
+		keys, next, err := Client.Scan(Ctx, cursor, "shops:list:*", 100).Result()
+		if err != nil {
+			log.Printf("cache scan error: %v", err)
+			return
+		}
+
+		if len(keys) > 0 {
+
+			if err := Client.Del(Ctx, keys...).Err(); err != nil {
+				log.Printf("cache delete error: %v", err)
+				return
+			}
+
+			log.Printf("🧹 cleared %d shop cache keys", len(keys))
+		}
+
+		cursor = next
+
+		if cursor == 0 {
+			break
+		}
+	}
+}
+
+// DeleteKey removes a single cache key.
+func DeleteKey(key string) {
+
+	if err := Client.Del(Ctx, key).Err(); err != nil {
+		log.Printf("cache delete error: %v", err)
+	}
+}
+
+// Set stores a value in Redis with expiration.
+func Set(key string, value interface{}, ttl time.Duration) {
+
+	if err := Client.Set(Ctx, key, value, ttl).Err(); err != nil {
+		log.Printf("cache set error: %v", err)
+	}
+}
+
+// Get retrieves a value from Redis.
+func Get(key string) (string, error) {
+	return Client.Get(Ctx, key).Result()
 }

@@ -28,9 +28,14 @@ import (
 func main() {
 
 	// ─────────────────────────────────────────────
-	// Load environment
+	// Load environment variables
 	// ─────────────────────────────────────────────
 	_ = godotenv.Load()
+
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "development"
+	}
 
 	// ─────────────────────────────────────────────
 	// Initialize tracing
@@ -44,7 +49,9 @@ func main() {
 	logger.Init()
 	defer logger.Log.Sync()
 
-	logger.Log.Info("starting shopen api")
+	logger.Log.Info("starting shopen api",
+		zap.String("env", env),
+	)
 
 	// ─────────────────────────────────────────────
 	// Initialize metrics
@@ -81,16 +88,25 @@ func main() {
 	// ─────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Middleware order (important)
+	// Core middleware
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.CleanPath)
 
-	r.Use(logger.LoggingMiddleware)
+	// Protection middleware
+	r.Use(middleware.TimeoutMiddleware(5 * time.Second))
 	r.Use(middleware.RateLimit)
+
+	// Observability
+	r.Use(logger.LoggingMiddleware)
 	r.Use(middleware.MetricsMiddleware)
 
-	r.Use(chimiddleware.CleanPath)
+	// Security headers
+	r.Use(chimiddleware.SetHeader("X-Content-Type-Options", "nosniff"))
+	r.Use(chimiddleware.SetHeader("X-Frame-Options", "DENY"))
+	r.Use(chimiddleware.SetHeader("X-XSS-Protection", "1; mode=block"))
+	r.Use(chimiddleware.SetHeader("Server", "shopen-api"))
 
 	// ─────────────────────────────────────────────
 	// CORS
@@ -170,7 +186,7 @@ func main() {
 
 	logger.Log.Info("server ready",
 		zap.String("address", addr),
-		zap.String("env", os.Getenv("ENV")),
+		zap.String("env", env),
 	)
 
 	handler := otelhttp.NewHandler(r, "http-server")
@@ -183,8 +199,12 @@ func main() {
 		IdleTimeout:  30 * time.Second,
 	}
 
-	// Run server
+	// ─────────────────────────────────────────────
+	// Start server
+	// ─────────────────────────────────────────────
 	go func() {
+
+		logger.Log.Info("http server started")
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 
@@ -205,10 +225,9 @@ func main() {
 
 	<-stop
 
-	logger.Log.Info("shutting down server")
+	logger.Log.Info("shutdown signal received")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
@@ -217,8 +236,10 @@ func main() {
 			zap.Error(err),
 		)
 
-	}
+	} else {
 
-	logger.Log.Info("server exited properly")
+		logger.Log.Info("server shutdown completed")
+
+	}
 
 }

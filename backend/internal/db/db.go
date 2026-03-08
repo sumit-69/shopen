@@ -1,19 +1,26 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/XSAM/otelsql"
 	_ "github.com/lib/pq"
+	"go.uber.org/zap"
 
 	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/shopen/backend/internal/logger"
 	"github.com/shopen/backend/internal/models"
+)
+
+const (
+	queryTimeout = 3 * time.Second
+	maxShopLimit = 100
 )
 
 // DB wraps *sql.DB and provides all database operations.
@@ -29,7 +36,7 @@ func New() (*DB, error) {
 		getenv("DB_HOST", "localhost"),
 		getenv("DB_PORT", "5432"),
 		getenv("DB_USER", "postgres"),
-		getenv("DB_PASSWORD", "pass"),
+		getenv("DB_PASSWORD", ""),
 		getenv("DB_NAME", "shopen"),
 		getenv("DB_SSLMODE", "disable"),
 	)
@@ -40,8 +47,7 @@ func New() (*DB, error) {
 			attribute.String("db.system", "postgresql"),
 		),
 	)
-
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "already registered") {
 		return nil, fmt.Errorf("register otel sql: %w", err)
 	}
 
@@ -50,33 +56,44 @@ func New() (*DB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	conn.SetMaxOpenConns(25)
-	conn.SetMaxIdleConns(10)
-	conn.SetConnMaxLifetime(5 * time.Minute)
+	conn.SetMaxOpenConns(50)
+	conn.SetMaxIdleConns(25)
+	conn.SetConnMaxLifetime(30 * time.Minute)
+	conn.SetConnMaxIdleTime(5 * time.Minute)
 
-	if err = conn.Ping(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err = conn.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 
-	log.Println("✅ Connected to PostgreSQL")
+	logger.Log.Info("database connected")
 
 	return &DB{conn: conn}, nil
 }
 
 // Close closes the underlying database connection.
-func (d *DB) Close() error { return d.conn.Close() }
+func (d *DB) Close() error {
+	return d.conn.Close()
+}
+
+// Ping checks database connectivity.
+func (d *DB) Ping(ctx context.Context) error {
+	return d.conn.PingContext(ctx)
+}
 
 // ─── SHOP QUERIES ─────────────────────────────────────────────────────────────
 
 // ListShops returns all shops matching the given filter.
-func (d *DB) ListShops(f models.ShopFilter) ([]models.Shop, error) {
+func (d *DB) ListShops(ctx context.Context, f models.ShopFilter) ([]models.Shop, error) {
 	query := `
 		SELECT id, name, category, subcat, icon, address, phone, hours,
 		       is_open, description, photo_url, map_query, created_at, updated_at
 		FROM shops
 		WHERE 1=1`
 
-	args := []interface{}{}
+	args := make([]interface{}, 0)
 	argIdx := 1
 
 	if f.Category != "" {
@@ -84,16 +101,31 @@ func (d *DB) ListShops(f models.ShopFilter) ([]models.Shop, error) {
 		args = append(args, f.Category)
 		argIdx++
 	}
+
 	if f.Subcat != "" {
 		query += fmt.Sprintf(" AND subcat = $%d", argIdx)
 		args = append(args, f.Subcat)
 		argIdx++
 	}
-	if f.Status == "open" {
-		query += " AND is_open = TRUE"
-	} else if f.Status == "closed" {
-		query += " AND is_open = FALSE"
+
+	switch f.Status {
+	case "":
+		// no filter
+
+	case "open":
+		query += fmt.Sprintf(" AND is_open = $%d", argIdx)
+		args = append(args, true)
+		argIdx++
+
+	case "closed":
+		query += fmt.Sprintf(" AND is_open = $%d", argIdx)
+		args = append(args, false)
+		argIdx++
+
+	default:
+		return nil, fmt.Errorf("invalid status filter")
 	}
+
 	if f.Search != "" {
 		query += fmt.Sprintf(
 			" AND (name ILIKE $%d OR address ILIKE $%d OR subcat ILIKE $%d)",
@@ -104,15 +136,24 @@ func (d *DB) ListShops(f models.ShopFilter) ([]models.Shop, error) {
 		argIdx += 3
 	}
 
-	query += " ORDER BY created_at DESC"
+	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT %d", maxShopLimit)
 
-	rows, err := d.conn.Query(query, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
+		logger.Log.Error("db query failed",
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("list shops: %w", err)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list shops: %w", err)
 	}
 	defer rows.Close()
 
-	var shops []models.Shop
+	shops := make([]models.Shop, 0, 20)
 	for rows.Next() {
 		var s models.Shop
 		if err := rows.Scan(
@@ -121,14 +162,18 @@ func (d *DB) ListShops(f models.ShopFilter) ([]models.Shop, error) {
 			&s.Description, &s.PhotoURL, &s.MapQuery,
 			&s.CreatedAt, &s.UpdatedAt,
 		); err != nil {
+			logger.Log.Error("scan shop failed", zap.Error(err))
 			return nil, fmt.Errorf("scan shop: %w", err)
 		}
 		shops = append(shops, s)
 	}
-	if shops == nil {
-		shops = []models.Shop{}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
 	}
-	return shops, rows.Err()
+
+	return shops, nil
+
 }
 
 // GetShopByID returns a single shop by its ID.
@@ -139,7 +184,11 @@ func (d *DB) GetShopByID(id int) (*models.Shop, error) {
 		FROM shops WHERE id = $1`
 
 	var s models.Shop
-	err := d.conn.QueryRow(query, id).Scan(
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	err := d.conn.QueryRowContext(ctx, query, id).Scan(
 		&s.ID, &s.Name, &s.Category, &s.Subcat, &s.Icon,
 		&s.Address, &s.Phone, &s.Hours, &s.IsOpen,
 		&s.Description, &s.PhotoURL, &s.MapQuery,
@@ -169,10 +218,21 @@ func (d *DB) CreateShop(req models.CreateShopRequest) (*models.Shop, error) {
 	}
 
 	var s models.Shop
-	err := d.conn.QueryRow(query,
-		req.Name, req.Category, req.Subcat, icon,
-		req.Address, req.Phone, req.Hours, req.IsOpen,
-		req.Description, req.PhotoURL, req.MapQuery,
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	err := d.conn.QueryRowContext(ctx, query,
+		req.Name,
+		req.Category,
+		req.Subcat,
+		icon,
+		req.Address,
+		req.Phone,
+		req.Hours,
+		req.IsOpen,
+		req.Description,
+		req.PhotoURL,
+		req.MapQuery,
 	).Scan(
 		&s.ID, &s.Name, &s.Category, &s.Subcat, &s.Icon,
 		&s.Address, &s.Phone, &s.Hours, &s.IsOpen,
@@ -188,7 +248,7 @@ func (d *DB) CreateShop(req models.CreateShopRequest) (*models.Shop, error) {
 // UpdateShop applies partial updates to a shop.
 func (d *DB) UpdateShop(id int, req models.UpdateShopRequest) (*models.Shop, error) {
 	setClauses := []string{}
-	args := []interface{}{}
+	args := make([]interface{}, 0)
 	argIdx := 1
 
 	if req.Name != nil {
@@ -261,7 +321,10 @@ func (d *DB) UpdateShop(id int, req models.UpdateShopRequest) (*models.Shop, err
 	args = append(args, id)
 
 	var s models.Shop
-	err := d.conn.QueryRow(query, args...).Scan(
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	err := d.conn.QueryRowContext(ctx, query, args...).Scan(
 		&s.ID, &s.Name, &s.Category, &s.Subcat, &s.Icon,
 		&s.Address, &s.Phone, &s.Hours, &s.IsOpen,
 		&s.Description, &s.PhotoURL, &s.MapQuery,
@@ -278,11 +341,19 @@ func (d *DB) UpdateShop(id int, req models.UpdateShopRequest) (*models.Shop, err
 
 // DeleteShop removes a shop by ID. Returns false if not found.
 func (d *DB) DeleteShop(id int) (bool, error) {
-	res, err := d.conn.Exec("DELETE FROM shops WHERE id=$1", id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	res, err := d.conn.ExecContext(ctx, "DELETE FROM shops WHERE id=$1", id)
 	if err != nil {
 		return false, fmt.Errorf("delete shop: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
 	return n > 0, nil
 }
 
@@ -295,7 +366,11 @@ func (d *DB) ToggleShopStatus(id int) (*models.Shop, error) {
 		          is_open, description, photo_url, map_query, created_at, updated_at`
 
 	var s models.Shop
-	err := d.conn.QueryRow(query, id).Scan(
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	err := d.conn.QueryRowContext(ctx, query, id).Scan(
 		&s.ID, &s.Name, &s.Category, &s.Subcat, &s.Icon,
 		&s.Address, &s.Phone, &s.Hours, &s.IsOpen,
 		&s.Description, &s.PhotoURL, &s.MapQuery,
@@ -320,7 +395,11 @@ func (d *DB) GetStats() (models.StatsResponse, error) {
 		FROM shops`
 
 	var s models.StatsResponse
-	err := d.conn.QueryRow(query).Scan(&s.Total, &s.Open, &s.Closed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	err := d.conn.QueryRowContext(ctx, query).Scan(&s.Total, &s.Open, &s.Closed)
 	if err != nil {
 		return s, fmt.Errorf("get stats: %w", err)
 	}
@@ -336,7 +415,11 @@ func (d *DB) GetStats() (models.StatsResponse, error) {
 func (d *DB) GetAdminByUsername(username string) (*models.Admin, error) {
 	const query = `SELECT id, username, password, created_at, updated_at FROM admins WHERE username=$1`
 	var a models.Admin
-	err := d.conn.QueryRow(query, username).Scan(
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	err := d.conn.QueryRowContext(ctx, query, username).Scan(
 		&a.ID, &a.Username, &a.Password, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
